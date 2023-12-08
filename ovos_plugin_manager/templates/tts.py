@@ -5,7 +5,7 @@ import re
 import requests
 import subprocess
 from ovos_bus_client.message import Message, dig_for_message
-from ovos_bus_client.session import Session, SessionManager
+from ovos_bus_client.session import SessionManager
 from ovos_config import Configuration
 from ovos_config.locations import get_xdg_cache_save_path
 from ovos_utils import classproperty
@@ -33,22 +33,10 @@ SSML_TAGS = re.compile(r'<[^>]*>')
 class TTSContext:
     _caches = {}
 
-    def __init__(self, session: Session = None):
-        self.session = session or SessionManager.get()
-
-    @property
-    def voice(self):
-        """ choose voice based on preferences """
-        prefs = self.session.tts_preferences["config"]
-        return prefs.get("voice", "default")
-
-    @property
-    def lang(self):
-        return self.session.lang
-
-    @property
-    def plugin_id(self):
-        return self.session.tts_preferences["plugin_id"]
+    def __init__(self, plugin_id: str, lang: str, voice: str):
+        self.plugin_id = plugin_id
+        self.lang = lang
+        self.voice = voice
 
     @property
     def tts_id(self):
@@ -449,6 +437,19 @@ class TTS:
             LOG.debug(f"no mouth movements available! unknown visemes for {sentence}")
         return viseme
 
+    def _get_ctxt(self, kwargs):
+        # get request specific synth params
+        message = kwargs.get("message") or dig_for_message()
+        lang = kwargs.get("lang")
+        voice = kwargs.get("voice")
+        if message:
+            sess = SessionManager.get(message)
+            lang = lang or sess.lang
+            voice = sess.tts_preferences["config"].get("voice")
+        return TTSContext(plugin_id=self.tts_name,  # TODO this should be the OPM name at some point
+                          lang=lang or self.lang,
+                          voice=voice or self.voice)
+
     def _execute(self, sentence, ident, listen, **kwargs):
         self.stopwatch.start()  # start timing metrics
 
@@ -464,10 +465,11 @@ class TTS:
                          "n_chunks": len(chunks)})
 
         # get request specific synth params
+        ctxt = self._get_ctxt(kwargs)
+
         message = kwargs.get("message") or \
                   dig_for_message() or \
                   Message("speak", context={"session": {"session_id": ident}})
-        ctxt = TTSContext(SessionManager.get(message))
 
         # synth -> queue for playback
         for sentence, l in chunks:
@@ -493,25 +495,13 @@ class TTS:
         sentence_hash = hash_sentence(sentence)
 
         # parse requested language for this TTS request
-        ctxt = ctxt or TTSContext()
-        if "lang" in kwargs:
-            ctxt.session.lang = kwargs["lang"]
-        else:
-            kwargs["lang"] = ctxt.lang
-        if "voice" in kwargs:
-            ctxt.session.tts_preferences["config"]["voice"] = kwargs["voice"]
-        else:
-            kwargs["voice"] = ctxt.voice
 
+        ctxt = ctxt or self._get_ctxt(kwargs)
         cache = ctxt.get_cache(self.audio_ext, self.config)
 
         # load from cache
         if self.enable_cache and sentence_hash in cache:
-            audio, phonemes = self.get_from_cache(sentence, cache)
-            if not phonemes:
-                # guess phonemes from sentence + cache them
-                pho_file = self._cache_phonemes(sentence, sentence_hash)
-                phonemes = pho_file.load()
+            audio, phonemes = ctxt.get_from_cache(sentence, cache)
             self.add_metric({"metric_type": "tts.synth.finished", "cache": True})
             return audio, phonemes
 
