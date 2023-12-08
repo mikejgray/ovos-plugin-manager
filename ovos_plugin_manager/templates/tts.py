@@ -117,13 +117,7 @@ class TTS:
         if TTS.queue is None:
             TTS.queue = Queue()
 
-        # NOTE: self.playback.start() was moved to init method
-        #   playback queue is not wanted if we only care about get_tts
-        #   init is called by mycroft, but non mycroft usage wont call it,
-        #   outside mycroft the enclosure is not set, bus is dummy and
-        #   playback thread is not used
         self.spellings = self.load_spellings()
-
         self._init_g2p()
 
         self.add_metric({"metric_type": "tts.init"})
