@@ -71,6 +71,8 @@ class TTSContext:
         sentence_hash = hash_sentence(sentence)
         phonemes = None
         cache = self.get_cache(audio_ext, cache_config)
+        if sentence_hash not in cache:
+            raise FileNotFoundError(f"sentence is not cached, {sentence_hash}.{audio_ext}")
         audio_file, pho_file = cache.cached_sentences[sentence_hash]
         LOG.info(f"Found {audio_file.name} in TTS cache")
         if pho_file:
