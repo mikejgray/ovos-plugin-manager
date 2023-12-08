@@ -21,30 +21,34 @@ movements for all TTS engines (only mimic implements this in upstream)
         # would hang here
         engine.playback.stop()
 """
+from os.path import isfile, join
+
 import inspect
 import random
 import re
-import subprocess
-from os.path import isfile, join
-from pathlib import Path
-from queue import Queue
-from threading import Thread
 import requests
+import subprocess
 from ovos_bus_client.message import Message, dig_for_message
+from ovos_bus_client.session import Session, SessionManager
 from ovos_config import Configuration
-from ovos_plugin_manager.g2p import OVOSG2PFactory, find_g2p_plugins
-from ovos_plugin_manager.templates.g2p import OutOfVocabulary
-from ovos_plugin_manager.utils.config import get_plugin_config
-from ovos_plugin_manager.utils.tts_cache import TextToSpeechCache, hash_sentence
+from ovos_config.locations import get_xdg_cache_save_path
 from ovos_utils import classproperty
 from ovos_utils import resolve_resource_file
 from ovos_utils.enclosure.api import EnclosureAPI
 from ovos_utils.file_utils import get_cache_directory
 from ovos_utils.lang.visimes import VISIMES
-from ovos_utils.log import LOG
+from ovos_utils.log import LOG, deprecated
 from ovos_utils.messagebus import FakeBus as BUS
 from ovos_utils.metrics import Stopwatch
 from ovos_utils.process_utils import RuntimeRequirements
+from pathlib import Path
+from queue import Queue
+from threading import Thread
+
+from ovos_plugin_manager.g2p import OVOSG2PFactory, find_g2p_plugins
+from ovos_plugin_manager.templates.g2p import OutOfVocabulary
+from ovos_plugin_manager.utils.config import get_plugin_config
+from ovos_plugin_manager.utils.tts_cache import TextToSpeechCache, hash_sentence
 
 EMPTY_PLAYBACK_QUEUE_TUPLE = (None, None, None, None, None)
 SSML_TAGS = re.compile(r'<[^>]*>')
@@ -68,65 +72,41 @@ class PlaybackThread(Thread):
 
 
 class TTSContext:
-    """ parses kwargs for valid signatures and extracts voice/lang optional parameters
-    it will look for a requested voice in kwargs and inside the source Message data if available.
-    voice can also be defined by a combination of language and gender,
-    in that case the helper method get_voice will be used to resolve the final voice_id
-    """
+    _caches = {}
 
-    def __init__(self, engine):
-        self.engine = engine
+    def __init__(self, session: Session = None):
+        self.session = session or SessionManager.get()
 
-    def get_message(self, kwargs):
-        msg = kwargs.get("message") or dig_for_message()
-        if msg and isinstance(msg, Message):
-            return msg
+    @property
+    def voice(self):
+        """ choose voice based on preferences """
+        prefs = self.session.tts_preferences["config"]
+        return prefs.get("voice", "default")
 
-    def get_lang(self, kwargs):
-        # parse requested language for this TTS request
-        # NOTE: this is ovos only functionality, not in mycroft-core!
-        lang = kwargs.get("lang")
-        message = self.get_message(kwargs)
-        if not lang and message:
-            # get lang from message object if possible
-            lang = message.data.get("lang") or \
-                   message.context.get("lang")
-        return lang or self.engine.lang
+    @property
+    def lang(self):
+        return self.session.lang
 
-    def get_gender(self, kwargs):
-        gender = kwargs.get("gender")
-        message = self.get_message(kwargs)
-        if not gender and message:
-            # get gender from message object if possible
-            gender = message.data.get("gender") or \
-                     message.context.get("gender")
-        return gender
+    @property
+    def plugin_id(self):
+        return self.session.tts_preferences["plugin_id"]
 
-    def get_voice(self, kwargs):
-        # parse requested voice for this TTS request
-        # NOTE: this is ovos only functionality, not in mycroft-core!
-        voice = kwargs.get("voice")
-        message = self.get_message(kwargs)
-        if not voice and message:
-            # get voice from message object if possible
-            voice = message.data.get("voice") or \
-                    message.context.get("voice")
+    @property
+    def tts_id(self):
+        return join(self.plugin_id, self.voice, self.lang)
 
-        if not voice:
-            gender = self.get_gender(kwargs)
-            if gender:
-                lang = self.get_lang(kwargs)
-                voice = self.engine.get_voice(gender, lang)
-
-        return voice or self.engine.voice
-
-    def get(self, kwargs=None):
-        kwargs = kwargs or {}
-        return self.get_lang(kwargs), self.get_voice(kwargs)
-
-    def get_cache(self, kwargs=None):
-        lang, voice = self.get(kwargs)
-        return self.engine.get_cache(voice, lang)
+    def get_cache(self, audio_ext="wav", cache_config=None):
+        cache_config = cache_config or {
+            "min_free_percent": 75,
+            "persist_cache": False,
+            "persist_thresh": 1,
+            "preloaded_cache": f"{get_xdg_cache_save_path()}/{self.tts_id}"
+        }
+        if self.tts_id not in TTSContext._caches:
+            TTSContext._caches[self.tts_id] = TextToSpeechCache(
+                cache_config, self.tts_id, audio_ext
+            )
+        return self._caches[self.tts_id]
 
 
 class TTS:
@@ -173,19 +153,12 @@ class TTS:
         if TTS.queue is None:
             TTS.queue = Queue()
 
-        self.context = TTSContext(self)
-
         # NOTE: self.playback.start() was moved to init method
         #   playback queue is not wanted if we only care about get_tts
         #   init is called by mycroft, but non mycroft usage wont call it,
         #   outside mycroft the enclosure is not set, bus is dummy and
         #   playback thread is not used
         self.spellings = self.load_spellings()
-
-        self.caches = {
-            self.tts_id: TextToSpeechCache(
-                self.config, self.tts_id, self.audio_ext
-            )}
 
         cfg = Configuration()
         g2pm = self.config.get("g2p_module")
@@ -204,8 +177,6 @@ class TTS:
         except:
             LOG.exception("G2P plugin not loaded, there will be no mouth movements")
             self.g2p = None
-
-        self.cache.curate()
 
         self.add_metric({"metric_type": "tts.init"})
 
@@ -240,28 +211,28 @@ class TTS:
         return RuntimeRequirements()
 
     @property
+    @deprecated("self.tts_id has been deprecated, use TTSContext().tts_id",
+                "0.1.0")
     def tts_id(self):
-        lang, voice = self.context.get()
-        return join(self.tts_name, voice, lang)
+        return TTSContext().tts_id
 
     @property
+    @deprecated("self.cache has been deprecated, use TTSContext().get_cache",
+                "0.1.0")
     def cache(self):
-        return self.caches.get(self.tts_id) or \
+        return TTSContext._caches.get(self.tts_id) or \
             self.get_cache()
 
     @cache.setter
+    @deprecated("self.cache has been deprecated, use TTSContext().get_cache",
+                "0.1.0")
     def cache(self, val):
-        self.caches[self.tts_id] = val
+        TTSContext._caches[self.tts_id] = val
 
+    @deprecated("get_cache has been deprecated, use TTSContext().get_cache directly",
+                "0.1.0")
     def get_cache(self, voice=None, lang=None):
-        lang = lang or self.lang
-        voice = voice or self.voice or "default"
-        tts_id = join(self.tts_name, voice, lang)
-        if tts_id not in self.caches:
-            self.caches[tts_id] = TextToSpeechCache(
-                self.config, tts_id, self.audio_ext
-            )
-        return self.caches[tts_id]
+        return TTSContext().get_cache(self.audio_ext, self.config)
 
     def handle_metric(self, metadata=None):
         """ receive timing metrics for diagnostics
@@ -282,7 +253,7 @@ class TTS:
         try:
             spellings_file = resolve_resource_file(path, config=config or Configuration())
         except:
-            LOG.debug('Failed to locate phonetic spellings resouce file.')
+            LOG.debug('Failed to locate phonetic spellings resource file.')
             return {}
         if not spellings_file:
             return {}
@@ -493,18 +464,44 @@ class TTS:
                     sentence = sentence.replace(word, spelled)
         return sentence
 
+    def _get_visemes(self, phonemes, sentence, ctxt):
+        # get visemes/mouth movements
+        viseme = []
+        if phonemes:
+            viseme = self.viseme(phonemes)
+        elif self.g2p is not None:
+            try:
+                viseme = self.g2p.utterance2visemes(sentence, ctxt.lang)
+            except OutOfVocabulary:
+                pass
+            except:
+                # this one is unplanned, let devs know all the info so they can fix it
+                LOG.exception(f"Unexpected failure in G2P plugin: {self.g2p}")
+
+        if not viseme:
+            # Debug level because this is expected in default installs
+            LOG.debug(f"no mouth movements available! unknown visemes for {sentence}")
+        return viseme
+
     def _execute(self, sentence, ident, listen, **kwargs):
-        self.stopwatch.start()
+        self.stopwatch.start()  # start timing metrics
+
+        # pre-process
         sentence = self._replace_phonetic_spellings(sentence)
         chunks = self._preprocess_sentence(sentence)
         # Apply the listen flag to the last chunk, set the rest to False
         chunks = [(chunks[i], listen if i == len(chunks) - 1 else False)
                   for i in range(len(chunks))]
+
+        # metrics timing callback
         self.add_metric({"metric_type": "tts.preprocessed",
                          "n_chunks": len(chunks)})
 
-        lang, voice = self.context.get(kwargs)
-        tts_id = join(self.tts_name, voice, lang)
+        # get request specific synth params
+        message = kwargs.get("message") or \
+                  dig_for_message() or \
+                  Message("speak", context={"session": {"session_id": ident}})
+        ctxt = TTSContext(SessionManager.get(message))
 
         # synth -> queue for playback
         for sentence, l in chunks:
@@ -512,31 +509,17 @@ class TTS:
             audio_file, phonemes = self.synth(sentence, **kwargs)
 
             # get visemes/mouth movements
-            viseme = []
-            if phonemes:
-                viseme = self.viseme(phonemes)
-            elif self.g2p is not None:
-                try:
-                    viseme = self.g2p.utterance2visemes(sentence, lang)
-                except OutOfVocabulary:
-                    pass
-                except:
-                    # this one is unplanned, let devs know all the info so they can fix it
-                    LOG.exception(f"Unexpected failure in G2P plugin: {self.g2p}")
+            viseme = self._get_visemes(phonemes, sentence, ctxt)
 
-            if not viseme:
-                # Debug level because this is expected in default installs
-                LOG.debug(f"no mouth movements available! unknown visemes for {sentence}")
-
-            message = kwargs.get("message") or \
-                      dig_for_message() or \
-                      Message("speak", context={"session": {"session_id": ident}})
+            # queue audio for playback
             TTS.queue.put(
-                (str(audio_file), viseme, l, tts_id, message)
+                (str(audio_file), viseme, l, ctxt.tts_id, message)
             )
+
+            # metrics timing callback
             self.add_metric({"metric_type": "tts.queued"})
 
-    def synth(self, sentence, **kwargs):
+    def synth(self, sentence, ctxt: TTSContext = None, **kwargs):
         """ This method wraps get_tts
         several optional keyword arguments are supported
         sentence will be read/saved to cache"""
@@ -545,15 +528,15 @@ class TTS:
 
         # parse requested language for this TTS request
         # NOTE: this is ovos/neon only functionality, not in mycroft-core!
-        lang, voice = self.context.get(kwargs)
-        kwargs["lang"] = lang
-        kwargs["voice"] = voice
+        ctxt = ctxt or TTSContext()
+        kwargs["lang"] = ctxt.lang
+        kwargs["voice"] = ctxt.voice
 
-        cache = self.get_cache(voice, lang)  # cache per tts_id (lang/voice combo)
+        cache = ctxt.get_cache(self.audio_ext, self.config)
 
         # load from cache
         if self.enable_cache and sentence_hash in cache:
-            audio, phonemes = self.get_from_cache(sentence, **kwargs)
+            audio, phonemes = self.get_from_cache(sentence, cache)
             self.add_metric({"metric_type": "tts.synth.finished", "cache": True})
             return audio, phonemes
 
@@ -574,11 +557,11 @@ class TTS:
 
         # cache sentence + phonemes
         if self.enable_cache:
-            self._cache_sentence(sentence, audio, phonemes, sentence_hash,
-                                 voice=voice, lang=lang)
+            self._cache_sentence(sentence, audio, cache,
+                                 phonemes, sentence_hash)
         return audio, phonemes
 
-    def _cache_phonemes(self, sentence, phonemes=None, sentence_hash=None):
+    def _cache_phonemes(self, sentence, cache: TextToSpeechCache = None, phonemes=None, sentence_hash=None):
         sentence_hash = sentence_hash or hash_sentence(sentence)
         if not phonemes and self.g2p is not None:
             try:
@@ -587,24 +570,24 @@ class TTS:
             except Exception as e:
                 self.add_metric({"metric_type": "tts.phonemes.g2p.error", "error": str(e)})
         if phonemes:
-            return self.save_phonemes(sentence_hash, phonemes)
+            phoneme_file = cache.define_phoneme_file(sentence_hash)
+            phoneme_file.save(phonemes)
+            return phoneme_file
         return None
 
-    def _cache_sentence(self, sentence, audio_file, phonemes=None, sentence_hash=None,
-                        voice=None, lang=None):
+    def _cache_sentence(self, sentence, audio_file, cache, phonemes=None, sentence_hash=None):
         sentence_hash = sentence_hash or hash_sentence(sentence)
         # RANT: why do you hate strings ChrisV?
         if isinstance(audio_file.path, str):
             audio_file.path = Path(audio_file.path)
-        pho_file = self._cache_phonemes(sentence, phonemes, sentence_hash)
-        cache = self.get_cache(voice=voice, lang=lang)
+        pho_file = self._cache_phonemes(sentence, cache, phonemes, sentence_hash)
         cache.cached_sentences[sentence_hash] = (audio_file, pho_file)
         self.add_metric({"metric_type": "tts.synth.cached"})
 
-    def get_from_cache(self, sentence, **kwargs):
+    def get_from_cache(self, sentence, cache: TextToSpeechCache = None):
         sentence_hash = hash_sentence(sentence)
         phonemes = None
-        cache = self.context.get_cache(kwargs)
+        cache = cache or TTSContext().get_cache(self.audio_ext, self.config)
         audio_file, pho_file = cache.cached_sentences[sentence_hash]
         LOG.info(f"Found {audio_file.name} in TTS cache")
         if not pho_file:
@@ -645,10 +628,15 @@ class TTS:
                                     float(0.2)))
         return visimes or None
 
+    @deprecated("clear_cache has been deprecated, use TTSContext().get_cache directly",
+                "0.1.0")
     def clear_cache(self):
         """ Remove all cached files. """
-        self.cache.clear()
+        cache = TTSContext().get_cache(self.audio_ext, self.config)
+        cache.clear()
 
+    @deprecated("save_phonemes has been deprecated, use TTSContext().get_cache directly",
+                "0.1.0")
     def save_phonemes(self, key, phonemes):
         """Cache phonemes
 
@@ -656,17 +644,21 @@ class TTS:
             key (str):        Hash key for the sentence
             phonemes (str):   phoneme string to save
         """
-        phoneme_file = self.cache.define_phoneme_file(key)
+        cache = TTSContext().get_cache(self.audio_ext, self.config)
+        phoneme_file = cache.define_phoneme_file(key)
         phoneme_file.save(phonemes)
         return phoneme_file
 
+    @deprecated("load_phonemes has been deprecated, use TTSContext().get_cache directly",
+                "0.1.0")
     def load_phonemes(self, key):
         """Load phonemes from cache file.
 
         Arguments:
             key (str): Key identifying phoneme cache
         """
-        phoneme_file = self.cache.define_phoneme_file(key)
+        cache = TTSContext().get_cache(self.audio_ext, self.config)
+        phoneme_file = cache.define_phoneme_file(key)
         return phoneme_file.load()
 
     def stop(self):
