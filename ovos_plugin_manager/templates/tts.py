@@ -108,6 +108,16 @@ class TTSContext:
             )
         return self._caches[self.tts_id]
 
+    def get_from_cache(self, sentence, audio_ext="wav", cache_config=None):
+        sentence_hash = hash_sentence(sentence)
+        phonemes = None
+        cache = self.get_cache(audio_ext, cache_config)
+        audio_file, pho_file = cache.cached_sentences[sentence_hash]
+        LOG.info(f"Found {audio_file.name} in TTS cache")
+        if pho_file:
+            phonemes = pho_file.load()
+        return audio_file, phonemes
+
 
 class TTS:
     """TTS abstract class to be implemented by all TTS engines.
@@ -125,7 +135,7 @@ class TTS:
     queue = None
     playback = None
 
-    def __init__(self, lang="en-us", config=None, validator=None,
+    def __init__(self, lang=None, config=None, validator=None,
                  audio_ext='wav', phonetic_spelling=True, ssml_tags=None):
         self.log_timestamps = False
 
@@ -134,7 +144,9 @@ class TTS:
         self.stopwatch = Stopwatch()
         self.tts_name = self.__class__.__name__
         self.bus = BUS()  # initialized in "init" step
-        self.lang = lang or self.config.get("lang") or 'en-us'
+        if lang:
+            self.lang = lang
+
         self.validator = validator or TTSValidator(self)
         self.phonetic_spelling = phonetic_spelling
         self.audio_ext = audio_ext
@@ -142,13 +154,6 @@ class TTS:
         self.log_timestamps = self.config.get("log_timestamps", False)
 
         self.enable_cache = self.config.get("enable_cache", True)
-
-        self.voice = self.config.get("voice") or "default"
-        # TODO can self.filename be deprecated ? is it used anywhere at all?
-        cache_dir = get_cache_directory(self.tts_name)
-        self.filename = join(cache_dir, 'tts.' + self.audio_ext)
-
-        random.seed()
 
         if TTS.queue is None:
             TTS.queue = Queue()
@@ -160,26 +165,11 @@ class TTS:
         #   playback thread is not used
         self.spellings = self.load_spellings()
 
-        cfg = Configuration()
-        g2pm = self.config.get("g2p_module")
-        if g2pm:
-            if g2pm in find_g2p_plugins():
-                cfg.setdefault("g2p", {})
-                globl = cfg["g2p"].get("module") or g2pm
-                if globl != g2pm:
-                    LOG.info(f"TTS requested {g2pm} explicitly, ignoring global module {globl} ")
-                cfg["g2p"]["module"] = g2pm
-            else:
-                LOG.warning(f"TTS selected {g2pm}, but it is not available!")
-
-        try:
-            self.g2p = OVOSG2PFactory.create(cfg)
-        except:
-            LOG.exception("G2P plugin not loaded, there will be no mouth movements")
-            self.g2p = None
+        self._init_g2p()
 
         self.add_metric({"metric_type": "tts.init"})
 
+    # methods for individual plugins to override
     @classproperty
     def runtime_requirements(self):
         """ skill developers should override this if they do not require connectivity
@@ -211,111 +201,14 @@ class TTS:
         return RuntimeRequirements()
 
     @property
-    @deprecated("self.tts_id has been deprecated, use TTSContext().tts_id",
-                "0.1.0")
-    def tts_id(self):
-        return TTSContext().tts_id
-
-    @property
-    @deprecated("self.cache has been deprecated, use TTSContext().get_cache",
-                "0.1.0")
-    def cache(self):
-        return TTSContext._caches.get(self.tts_id) or \
-            self.get_cache()
-
-    @cache.setter
-    @deprecated("self.cache has been deprecated, use TTSContext().get_cache",
-                "0.1.0")
-    def cache(self, val):
-        TTSContext._caches[self.tts_id] = val
-
-    @deprecated("get_cache has been deprecated, use TTSContext().get_cache directly",
-                "0.1.0")
-    def get_cache(self, voice=None, lang=None):
-        return TTSContext().get_cache(self.audio_ext, self.config)
-
-    def handle_metric(self, metadata=None):
-        """ receive timing metrics for diagnostics
-        does nothing by default but plugins might use it, eg, NeonCore"""
-
-    def add_metric(self, metadata=None):
-        """ wraps handle_metric to catch exceptions and log timestamps """
-        try:
-            self.handle_metric(metadata)
-            if self.log_timestamps:
-                LOG.debug(f"time delta: {self.stopwatch.delta} metric: {metadata}")
-        except Exception as e:
-            LOG.exception(e)
-
-    def load_spellings(self, config=None):
-        """Load phonetic spellings of words as dictionary."""
-        path = join('text', self.lang.lower(), 'phonetic_spellings.txt')
-        try:
-            spellings_file = resolve_resource_file(path, config=config or Configuration())
-        except:
-            LOG.debug('Failed to locate phonetic spellings resource file.')
-            return {}
-        if not spellings_file:
-            return {}
-        try:
-            with open(spellings_file) as f:
-                lines = filter(bool, f.read().split('\n'))
-            lines = [i.split(':') for i in lines]
-            return {key.strip(): value.strip() for key, value in lines}
-        except ValueError:
-            LOG.exception('Failed to load phonetic spellings.')
-            return {}
-
-    def begin_audio(self):
-        """Helper function for child classes to call in execute()"""
-        self.add_metric({"metric_type": "tts.start"})
-
-    def end_audio(self, listen=False):
-        """Helper cleanup function for child classes to call in execute().
-
-        Arguments:
-            listen (bool): DEPRECATED: indication if listening trigger should be sent.
+    def available_languages(self) -> set:
+        """Return languages supported by this TTS implementation in this state
+        This property should be overridden by the derived class to advertise
+        what languages that engine supports.
+        Returns:
+            set: supported languages
         """
-        self.add_metric({"metric_type": "tts.end"})
-        self.stopwatch.stop()
-
-    def init(self, bus=None, playback=None):
-        """ Performs intial setup of TTS object.
-
-        Arguments:
-            bus:    OpenVoiceOS messagebus connection
-        """
-        self.bus = bus or BUS()
-        if playback is None:
-            LOG.warning("PlaybackThread should be inited by ovos-audio, initing via plugin has been deprecated, "
-                        "please pass playback=PlaybackThread() to TTS.init")
-            if TTS.playback:
-                playback.shutdown()
-            playback = PlaybackThread(TTS.queue, self.bus)  # compat
-            playback.start()
-        self._init_playback(playback)
-        self.add_metric({"metric_type": "tts.setup"})
-
-    def _init_playback(self, playback):
-        TTS.playback = playback
-        TTS.playback.set_bus(self.bus)
-        TTS.playback.attach_tts(self)
-        if not TTS.playback.enclosure:
-            TTS.playback.enclosure = EnclosureAPI(self.bus)
-
-        if not TTS.playback.is_running:
-            TTS.playback.start()
-
-    @property
-    def enclosure(self):
-        if not TTS.playback.enclosure:
-            bus = TTS.playback.bus or self.bus
-            TTS.playback.enclosure = EnclosureAPI(bus)
-        return TTS.playback.enclosure
-
-    @enclosure.setter
-    def enclosure(self, val):
-        TTS.playback.enclosure = val
+        return set()
 
     def get_tts(self, sentence, wav_file, lang=None):
         """Abstract method that a tts implementation needs to implement.
@@ -332,6 +225,26 @@ class TTS:
         """
         return "", None
 
+    def get_voice(self, gender, lang=None):
+        """ map a language and gender to a valid voice for this TTS engine """
+        lang = lang or self.lang
+        return gender
+
+    def _preprocess_sentence(self, sentence):
+        """Default preprocessing is no preprocessing.
+
+        This method can be overridden to create chunks suitable to the
+        TTS engine in question.
+
+        Arguments:
+            sentence (str): sentence to preprocess
+
+        Returns:
+            list: list of sentence parts
+        """
+        # TODO - make public
+        return [sentence]
+
     def modify_tag(self, tag):
         """Override to modify each supported ssml tag.
 
@@ -340,6 +253,28 @@ class TTS:
         """
         return tag
 
+    def handle_metric(self, metadata=None):
+        """ receive timing metrics for diagnostics
+        does nothing by default but plugins might use it, eg, NeonCore"""
+
+    # properties that reflect live config changes
+    @property
+    def voice(self):
+        return self.config.get("voice") or "default"
+
+    @voice.setter
+    def voice(self, val):
+        self.config["voice"] = val
+
+    @property
+    def lang(self):
+        return self.config.get("lang") or 'en-us'
+
+    @lang.setter
+    def lang(self, val):
+        self.config["lang"] = val
+
+    # SSML helpers
     @staticmethod
     def remove_ssml(text):
         """Removes SSML tags from a string.
@@ -426,19 +361,94 @@ class TTS:
         # return text with supported ssml tags only
         return utterance.replace("  ", " ")
 
-    def _preprocess_sentence(self, sentence):
-        """Default preprocessing is no preprocessing.
+    # init helpers
+    def _init_g2p(self):
+        cfg = Configuration()
+        g2pm = self.config.get("g2p_module")
+        if g2pm:
+            if g2pm in find_g2p_plugins():
+                cfg.setdefault("g2p", {})
+                globl = cfg["g2p"].get("module") or g2pm
+                if globl != g2pm:
+                    LOG.info(f"TTS requested {g2pm} explicitly, ignoring global module {globl} ")
+                cfg["g2p"]["module"] = g2pm
+            else:
+                LOG.warning(f"TTS selected {g2pm}, but it is not available!")
 
-        This method can be overridden to create chunks suitable to the
-        TTS engine in question.
+        try:
+            self.g2p = OVOSG2PFactory.create(cfg)
+        except:
+            LOG.debug("G2P plugin not loaded, there will be no mouth movements")
+            self.g2p = None
+
+    def init(self, bus=None, playback=None):
+        """ Performs intial setup of TTS object.
 
         Arguments:
-            sentence (str): sentence to preprocess
-
-        Returns:
-            list: list of sentence parts
+            bus:    OpenVoiceOS messagebus connection
         """
-        return [sentence]
+        self.bus = bus or BUS()
+        if playback is None:
+            LOG.warning("PlaybackThread should be inited by ovos-audio, initing via plugin has been deprecated, "
+                        "please pass playback=PlaybackThread() to TTS.init")
+            if TTS.playback:
+                playback.shutdown()
+            playback = PlaybackThread(TTS.queue, self.bus)  # compat
+            playback.start()
+        self._init_playback(playback)
+        self.add_metric({"metric_type": "tts.setup"})
+
+    def _init_playback(self, playback):
+        TTS.playback = playback
+        TTS.playback.set_bus(self.bus)
+        TTS.playback.attach_tts(self)
+        if not TTS.playback.enclosure:
+            TTS.playback.enclosure = EnclosureAPI(self.bus)
+
+        if not TTS.playback.is_running:
+            TTS.playback.start()
+
+    def load_spellings(self, config=None):
+        """Load phonetic spellings of words as dictionary."""
+        path = join('text', self.lang.lower(), 'phonetic_spellings.txt')
+        try:
+            spellings_file = resolve_resource_file(path, config=config or Configuration())
+        except:
+            LOG.debug('Failed to locate phonetic spellings resource file.')
+            return {}
+        if not spellings_file:
+            return {}
+        try:
+            with open(spellings_file) as f:
+                lines = filter(bool, f.read().split('\n'))
+            lines = [i.split(':') for i in lines]
+            return {key.strip(): value.strip() for key, value in lines}
+        except ValueError:
+            LOG.exception('Failed to load phonetic spellings.')
+            return {}
+
+    ## execution events
+    def add_metric(self, metadata=None):
+        """ wraps handle_metric to catch exceptions and log timestamps """
+        try:
+            self.handle_metric(metadata)
+            if self.log_timestamps:
+                LOG.debug(f"time delta: {self.stopwatch.delta} metric: {metadata}")
+        except Exception as e:
+            LOG.exception(e)
+
+    def begin_audio(self):
+        """Helper function for child classes to call in execute()"""
+        self.add_metric({"metric_type": "tts.start"})
+
+    def end_audio(self, listen=False):
+        """Helper cleanup function for child classes to call in execute().
+
+        Arguments:
+            listen (bool): DEPRECATED: indication if listening trigger should be sent.
+        """
+        self.add_metric({"metric_type": "tts.end"})
+        self.stopwatch.stop()
 
     def execute(self, sentence, ident=None, listen=False, **kwargs):
         """Convert sentence to speech, preprocessing out unsupported ssml
@@ -456,6 +466,7 @@ class TTS:
         self.add_metric({"metric_type": "tts.ssml.validated"})
         self._execute(sentence, ident, listen, **kwargs)
 
+    ## synth
     def _replace_phonetic_spellings(self, sentence):
         if self.phonetic_spelling:
             for word in re.findall(r"[\w']+", sentence):
@@ -506,7 +517,7 @@ class TTS:
         # synth -> queue for playback
         for sentence, l in chunks:
             # load from cache or synth + cache
-            audio_file, phonemes = self.synth(sentence, **kwargs)
+            audio_file, phonemes = self.synth(sentence, ctxt, **kwargs)
 
             # get visemes/mouth movements
             viseme = self._get_visemes(phonemes, sentence, ctxt)
@@ -537,6 +548,10 @@ class TTS:
         # load from cache
         if self.enable_cache and sentence_hash in cache:
             audio, phonemes = self.get_from_cache(sentence, cache)
+            if not phonemes:
+                # guess phonemes from sentence + cache them
+                pho_file = self._cache_phonemes(sentence, sentence_hash)
+                phonemes = pho_file.load()
             self.add_metric({"metric_type": "tts.synth.finished", "cache": True})
             return audio, phonemes
 
@@ -560,47 +575,6 @@ class TTS:
             self._cache_sentence(sentence, audio, cache,
                                  phonemes, sentence_hash)
         return audio, phonemes
-
-    def _cache_phonemes(self, sentence, cache: TextToSpeechCache = None, phonemes=None, sentence_hash=None):
-        sentence_hash = sentence_hash or hash_sentence(sentence)
-        if not phonemes and self.g2p is not None:
-            try:
-                phonemes = self.g2p.utterance2arpa(sentence, self.lang)
-                self.add_metric({"metric_type": "tts.phonemes.g2p"})
-            except Exception as e:
-                self.add_metric({"metric_type": "tts.phonemes.g2p.error", "error": str(e)})
-        if phonemes:
-            phoneme_file = cache.define_phoneme_file(sentence_hash)
-            phoneme_file.save(phonemes)
-            return phoneme_file
-        return None
-
-    def _cache_sentence(self, sentence, audio_file, cache, phonemes=None, sentence_hash=None):
-        sentence_hash = sentence_hash or hash_sentence(sentence)
-        # RANT: why do you hate strings ChrisV?
-        if isinstance(audio_file.path, str):
-            audio_file.path = Path(audio_file.path)
-        pho_file = self._cache_phonemes(sentence, cache, phonemes, sentence_hash)
-        cache.cached_sentences[sentence_hash] = (audio_file, pho_file)
-        self.add_metric({"metric_type": "tts.synth.cached"})
-
-    def get_from_cache(self, sentence, cache: TextToSpeechCache = None):
-        sentence_hash = hash_sentence(sentence)
-        phonemes = None
-        cache = cache or TTSContext().get_cache(self.audio_ext, self.config)
-        audio_file, pho_file = cache.cached_sentences[sentence_hash]
-        LOG.info(f"Found {audio_file.name} in TTS cache")
-        if not pho_file:
-            # guess phonemes from sentence + cache them
-            pho_file = self._cache_phonemes(sentence, sentence_hash)
-        if pho_file:
-            phonemes = pho_file.load()
-        return audio_file, phonemes
-
-    def get_voice(self, gender, lang=None):
-        """ map a language and gender to a valid voice for this TTS engine """
-        lang = lang or self.lang
-        return gender
 
     def viseme(self, phonemes):
         """Create visemes from phonemes.
@@ -627,6 +601,101 @@ class TTS:
                     visimes.append((VISIMES.get(pair, '4'),
                                     float(0.2)))
         return visimes or None
+
+    ## cache
+    def _cache_phonemes(self, sentence, cache: TextToSpeechCache = None, phonemes=None, sentence_hash=None):
+        sentence_hash = sentence_hash or hash_sentence(sentence)
+        if not phonemes and self.g2p is not None:
+            try:
+                phonemes = self.g2p.utterance2arpa(sentence, self.lang)
+                self.add_metric({"metric_type": "tts.phonemes.g2p"})
+            except Exception as e:
+                self.add_metric({"metric_type": "tts.phonemes.g2p.error", "error": str(e)})
+        if phonemes:
+            phoneme_file = cache.define_phoneme_file(sentence_hash)
+            phoneme_file.save(phonemes)
+            return phoneme_file
+        return None
+
+    def _cache_sentence(self, sentence, audio_file, cache, phonemes=None, sentence_hash=None):
+        sentence_hash = sentence_hash or hash_sentence(sentence)
+        # RANT: why do you hate strings ChrisV?
+        if isinstance(audio_file.path, str):
+            audio_file.path = Path(audio_file.path)
+        pho_file = self._cache_phonemes(sentence, cache, phonemes, sentence_hash)
+        cache.cached_sentences[sentence_hash] = (audio_file, pho_file)
+        self.add_metric({"metric_type": "tts.synth.cached"})
+
+    ## shutdown
+    def stop(self):
+        if TTS.playback:
+            try:
+                TTS.playback.stop()
+            except Exception as e:
+                pass
+        self.add_metric({"metric_type": "tts.stop"})
+
+    def shutdown(self):
+        self.stop()
+        if TTS.playback:
+            TTS.playback.detach_tts(self)
+
+    def __del__(self):
+        self.shutdown()
+
+    # below code is all deprecated and marked for removal in next stable release
+    # TODO - update version number in warnings
+    @property
+    @deprecated("self.enclosure has been deprecated, use EnclosureAPI directly decoupled from the plugin code",
+                "0.1.0")
+    def enclosure(self):
+        if not TTS.playback.enclosure:
+            bus = TTS.playback.bus or self.bus
+            TTS.playback.enclosure = EnclosureAPI(bus)
+        return TTS.playback.enclosure
+
+    @enclosure.setter
+    @deprecated("self.enclosure has been deprecated, use EnclosureAPI directly decoupled from the plugin code",
+                "0.1.0")
+    def enclosure(self, val):
+        TTS.playback.enclosure = val
+
+    @property
+    @deprecated("self.filename has been deprecated, unused for a long time now",
+                "0.1.0")
+    def filename(self):
+        cache_dir = get_cache_directory(self.tts_name)
+        return join(cache_dir, 'tts.' + self.audio_ext)
+
+    @filename.setter
+    @deprecated("self.filename has been deprecated, unused for a long time now",
+                "0.1.0")
+    def filename(self, val):
+        pass
+
+    @property
+    @deprecated("self.tts_id has been deprecated, use TTSContext().tts_id",
+                "0.1.0")
+    def tts_id(self):
+        return TTSContext().tts_id
+
+    @property
+    @deprecated("self.cache has been deprecated, use TTSContext().get_cache",
+                "0.1.0")
+    def cache(self):
+        return TTSContext._caches.get(self.tts_id) or \
+            self.get_cache()
+
+    @cache.setter
+    @deprecated("self.cache has been deprecated, use TTSContext().get_cache",
+                "0.1.0")
+    def cache(self, val):
+        TTSContext._caches[self.tts_id] = val
+
+    @deprecated("get_cache has been deprecated, use TTSContext().get_cache directly",
+                "0.1.0")
+    def get_cache(self, voice=None, lang=None):
+        return TTSContext().get_cache(self.audio_ext, self.config)
 
     @deprecated("clear_cache has been deprecated, use TTSContext().get_cache directly",
                 "0.1.0")
@@ -661,31 +730,10 @@ class TTS:
         phoneme_file = cache.define_phoneme_file(key)
         return phoneme_file.load()
 
-    def stop(self):
-        if TTS.playback:
-            try:
-                TTS.playback.stop()
-            except Exception as e:
-                pass
-        self.add_metric({"metric_type": "tts.stop"})
-
-    def shutdown(self):
-        self.stop()
-        if TTS.playback:
-            TTS.playback.detach_tts(self)
-
-    def __del__(self):
-        self.shutdown()
-
-    @property
-    def available_languages(self) -> set:
-        """Return languages supported by this TTS implementation in this state
-        This property should be overridden by the derived class to advertise
-        what languages that engine supports.
-        Returns:
-            set: supported languages
-        """
-        return set()
+    @deprecated("get_from_cache has been deprecated, use TTSContext().get_from_cache directly",
+                "0.1.0")
+    def get_from_cache(self, sentence):
+        return TTSContext().get_from_cache(sentence, self.audio_ext, self.config)
 
 
 class TTSValidator:
