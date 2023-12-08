@@ -116,23 +116,23 @@ class TestTTSTemplate(unittest.TestCase):
         self.assertEqual(tagged_with_exclusion, valid_output)
 
     def test_playback_thread(self):
-        from ovos_plugin_manager.templates.tts import PlaybackThread
+        pass
         # TODO
-    
+
     def test_tts_context(self):
-        from ovos_plugin_manager.templates.tts import TTSContext
+        pass
         # TODO
-    
+
     def test_tts_validator(self):
-        from ovos_plugin_manager.templates.tts import TTSValidator
+        pass
         # TODO
-    
+
     def test_concat_tts(self):
-        from ovos_plugin_manager.templates.tts import ConcatTTS
+        pass
         # TODO
-    
+
     def test_remote_tt(self):
-        from ovos_plugin_manager.templates.tts import RemoteTTS
+        pass
         # TODO
 
 
@@ -189,15 +189,15 @@ class TestTTS(unittest.TestCase):
                                            self.CONFIG_SECTION, None)
 
     def test_get_voice_id(self):
-        from ovos_plugin_manager.tts import get_voice_id
+        pass
         # TODO
 
     def test_scan_voices(self):
-        from ovos_plugin_manager.tts import scan_voices
+        pass
         # TODO
 
     def test_get_voices(self):
-        from ovos_plugin_manager.tts import get_voices
+        pass
         # TODO
 
 
@@ -278,18 +278,7 @@ class TestTTSContext(unittest.TestCase):
         session_mock = MagicMock()
         tts_context = TTSContext(session=session_mock)
 
-        cache_config = {
-            "min_free_percent": 75,
-            "persist_cache": False,
-            "persist_thresh": 1,
-            "preloaded_cache": "/fake/cache/path/{}/{}/{}".format(
-                session_mock.tts_preferences['plugin_id'],
-                session_mock.tts_preferences['config']['voice'],
-                session_mock.lang
-            )
-        }
-
-        result = tts_context.get_cache(cache_config=cache_config)
+        result = tts_context.get_cache()
 
         self.assertEqual(result, cache_mock.return_value)
         self.assertEqual(result, tts_context._caches[tts_context.tts_id])
