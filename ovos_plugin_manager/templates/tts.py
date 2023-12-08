@@ -1,30 +1,6 @@
-"""
-this module is meant to enable usage of mycroft plugins inside and outside
-mycroft, importing from here will make things work as planned in mycroft,
-but if outside mycroft things will still work
-
-The main use case is for plugins to be used across different projects
-
-## Differences from upstream
-
-TTS:
-- added automatic guessing of phonemes/visime calculation, enabling mouth
-movements for all TTS engines (only mimic implements this in upstream)
-- playback start call has been omitted and moved to init method
-- init is called by mycroft, but non mycroft usage wont call it
-- outside mycroft the enclosure is not set, bus is dummy and playback thread is not used
-    - playback queue is not wanted when some module is calling get_tts
-    - if playback was started on init then python scripts would never stop
-        from mycroft.tts import TTSFactory
-        engine = TTSFactory.create()
-        engine.get_tts("hello world", "hello_world." + engine.audio_ext)
-        # would hang here
-        engine.playback.stop()
-"""
 from os.path import isfile, join
 
 import inspect
-import random
 import re
 import requests
 import subprocess
@@ -52,23 +28,6 @@ from ovos_plugin_manager.utils.tts_cache import TextToSpeechCache, hash_sentence
 
 EMPTY_PLAYBACK_QUEUE_TUPLE = (None, None, None, None, None)
 SSML_TAGS = re.compile(r'<[^>]*>')
-
-
-class PlaybackThread(Thread):
-    """ PlaybackThread moved to ovos_audio.playback
-    standalone plugin usage should rely on self.get_tts
-    ovos-audio relies on self.execute and needs this class
-
-    this class was only in ovos-plugin-manager in order to
-    patch usage of our plugins in mycroft-core"""
-
-    def __new__(self, *args, **kwargs):
-        LOG.warning("PlaybackThread moved to ovos_audio.playback")
-        try:
-            from ovos_audio.playback import PlaybackThread
-            return PlaybackThread(*args, **kwargs)
-        except ImportError:
-            raise ImportError("please install ovos-audio for playback handling")
 
 
 class TTSContext:
@@ -837,6 +796,8 @@ class RemoteTTSTimeoutException(RemoteTTSException):
     pass
 
 
+# below classes are deprecated and will be removed in 0.1.0
+
 class RemoteTTS(TTS):
     """
     Abstract class for a Remote TTS engine implementation.
@@ -844,6 +805,8 @@ class RemoteTTS(TTS):
     Usage is discouraged
     """
 
+    @deprecated("RemoteTTS has been deprecated, please use the regular TTS class",
+                "0.1.0")
     def __init__(self, lang, config, url, api_path, validator):
         super(RemoteTTS, self).__init__(lang, config, validator)
         self.api_path = api_path
@@ -862,3 +825,20 @@ class RemoteTTS(TTS):
         with open(wav_file, 'wb') as f:
             f.write(r.content)
         return wav_file, None
+
+
+class PlaybackThread(Thread):
+    """ PlaybackThread moved to ovos_audio.playback
+    standalone plugin usage should rely on self.get_tts
+    ovos-audio relies on self.execute and needs this class
+
+    this class was only in ovos-plugin-manager in order to
+    patch usage of our plugins in mycroft-core"""
+
+    def __new__(self, *args, **kwargs):
+        LOG.warning("PlaybackThread moved to ovos_audio.playback")
+        try:
+            from ovos_audio.playback import PlaybackThread
+            return PlaybackThread(*args, **kwargs)
+        except ImportError:
+            raise ImportError("please install ovos-audio for playback handling")
