@@ -491,10 +491,15 @@ class TTS:
         sentence_hash = hash_sentence(sentence)
 
         # parse requested language for this TTS request
-        # NOTE: this is ovos/neon only functionality, not in mycroft-core!
         ctxt = ctxt or TTSContext()
-        kwargs["lang"] = ctxt.lang
-        kwargs["voice"] = ctxt.voice
+        if "lang" in kwargs:
+            ctxt.session.lang = kwargs["lang"]
+        else:
+            kwargs["lang"] = ctxt.lang
+        if "voice" in kwargs:
+            ctxt.session.tts_preferences["config"]["voice"] = kwargs["voice"]
+        else:
+            kwargs["voice"] = ctxt.voice
 
         cache = ctxt.get_cache(self.audio_ext, self.config)
 
@@ -512,7 +517,6 @@ class TTS:
         audio = cache.define_audio_file(sentence_hash)
 
         # filter kwargs per plugin, different plugins expose different options
-        #   mycroft-core -> no kwargs
         #   ovos -> lang + voice optional kwargs
         #   neon-core -> message
         kwargs = {k: v for k, v in kwargs.items()
