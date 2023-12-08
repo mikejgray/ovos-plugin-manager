@@ -445,7 +445,7 @@ class TTS:
         if message:
             sess = SessionManager.get(message)
             lang = lang or sess.lang
-            voice = sess.tts_preferences["config"].get("voice")
+            voice = voice or sess.tts_preferences["config"].get("voice")
         return TTSContext(plugin_id=self.tts_name,  # TODO this should be the OPM name at some point
                           lang=lang or self.lang,
                           voice=voice or self.voice)
