@@ -300,7 +300,11 @@ class TTS:
             self.g2p = None
 
     def init(self, bus=None, playback=None):
-        """ Performs intial setup of TTS object.
+        """ Connects TTS object to PlaybackQueue in ovos-audio.
+
+        This method needs to be called in order for self.execute to do anything
+
+        not needed if using get_tts / synth  methods directly as intended in standalone usage
 
         Arguments:
             bus:    OpenVoiceOS messagebus connection
