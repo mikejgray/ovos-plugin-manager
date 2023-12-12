@@ -92,7 +92,6 @@ class TTS:
 
         self.stopwatch = Stopwatch()
         self.tts_name = self.__class__.__name__
-        self.bus = BUS()  # initialized in "init" step
         if lang:
             self.lang = lang
 
@@ -102,7 +101,7 @@ class TTS:
         self.ssml_tags = ssml_tags or []
         self.log_timestamps = self.config.get("log_timestamps", False)
 
-        self.enable_cache = self.config.get("enable_cache", True)
+        self.enable_cache = self.config.get("enable_cache", False)
 
         if TTS.queue is None:
             TTS.queue = Queue()
@@ -112,35 +111,16 @@ class TTS:
 
         self.add_metric({"metric_type": "tts.init"})
 
+        # unused by plugins, assigned in init method by ovos-audio,
+        # only present for backwards compat reasons
+        self.bus = None
+
     # methods for individual plugins to override
     @classproperty
     def runtime_requirements(self):
-        """ skill developers should override this if they do not require connectivity
-         some examples:
-         IOT plugin that controls devices via LAN could return:
-            scans_on_init = True
-            RuntimeRequirements(internet_before_load=False,
-                                 network_before_load=scans_on_init,
-                                 requires_internet=False,
-                                 requires_network=True,
-                                 no_internet_fallback=True,
-                                 no_network_fallback=False)
-         online search plugin with a local cache:
-            has_cache = False
-            RuntimeRequirements(internet_before_load=not has_cache,
-                                 network_before_load=not has_cache,
-                                 requires_internet=True,
-                                 requires_network=True,
-                                 no_internet_fallback=True,
-                                 no_network_fallback=True)
-         a fully offline plugin:
-            RuntimeRequirements(internet_before_load=False,
-                                 network_before_load=False,
-                                 requires_internet=False,
-                                 requires_network=False,
-                                 no_internet_fallback=True,
-                                 no_network_fallback=True)
-        """
+        """ WIP - currently unused,
+        placeholder to allow plugins to request internet/gui before load
+        refer to skills to see how it is used"""
         return RuntimeRequirements()
 
     @property
@@ -167,11 +147,6 @@ class TTS:
             tuple: (wav_file, phoneme)
         """
         return "", None
-
-    def get_voice(self, gender, lang=None):
-        """ map a language and gender to a valid voice for this TTS engine """
-        lang = lang or self.lang
-        return gender
 
     def _preprocess_sentence(self, sentence):
         """Default preprocessing is no preprocessing.
@@ -437,7 +412,8 @@ class TTS:
             LOG.debug(f"no mouth movements available! unknown visemes for {sentence}")
         return viseme
 
-    def _get_ctxt(self, kwargs):
+    def _get_ctxt(self, kwargs=None):
+        kwargs = kwargs or {}
         # get request specific synth params
         message = kwargs.get("message") or dig_for_message()
         lang = kwargs.get("lang")
@@ -626,7 +602,7 @@ class TTS:
     @deprecated("self.tts_id has been deprecated, use TTSContext().tts_id",
                 "0.1.0")
     def tts_id(self):
-        return TTSContext().tts_id
+        return self._get_ctxt().tts_id
 
     @property
     @deprecated("self.cache has been deprecated, use TTSContext().get_cache",
@@ -641,16 +617,23 @@ class TTS:
     def cache(self, val):
         TTSContext._caches[self.tts_id] = val
 
+    @deprecated("get_voice was never formally adopted and is unused, it will be removed",
+                "0.1.0")
+    def get_voice(self, gender, lang=None):
+        """ map a language and gender to a valid voice for this TTS engine """
+        lang = lang or self.lang
+        return gender
+
     @deprecated("get_cache has been deprecated, use TTSContext().get_cache directly",
                 "0.1.0")
     def get_cache(self, voice=None, lang=None):
-        return TTSContext().get_cache(self.audio_ext, self.config)
+        return self._get_ctxt().get_cache(self.audio_ext, self.config)
 
     @deprecated("clear_cache has been deprecated, use TTSContext().get_cache directly",
                 "0.1.0")
     def clear_cache(self):
         """ Remove all cached files. """
-        cache = TTSContext().get_cache(self.audio_ext, self.config)
+        cache = self._get_ctxt().get_cache(self.audio_ext, self.config)
         cache.clear()
 
     @deprecated("save_phonemes has been deprecated, use TTSContext().get_cache directly",
@@ -662,7 +645,7 @@ class TTS:
             key (str):        Hash key for the sentence
             phonemes (str):   phoneme string to save
         """
-        cache = TTSContext().get_cache(self.audio_ext, self.config)
+        cache = self._get_ctxt().get_cache(self.audio_ext, self.config)
         phoneme_file = cache.define_phoneme_file(key)
         phoneme_file.save(phonemes)
         return phoneme_file
@@ -675,14 +658,14 @@ class TTS:
         Arguments:
             key (str): Key identifying phoneme cache
         """
-        cache = TTSContext().get_cache(self.audio_ext, self.config)
+        cache = self._get_ctxt().get_cache(self.audio_ext, self.config)
         phoneme_file = cache.define_phoneme_file(key)
         return phoneme_file.load()
 
     @deprecated("get_from_cache has been deprecated, use TTSContext().get_from_cache directly",
                 "0.1.0")
     def get_from_cache(self, sentence):
-        return TTSContext().get_from_cache(sentence, self.audio_ext, self.config)
+        return self._get_ctxt().get_from_cache(sentence, self.audio_ext, self.config)
 
 
 class TTSValidator:
